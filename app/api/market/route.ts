@@ -1,8 +1,14 @@
-import type { InstrumentData, MarketBar, MarketSession } from "@/lib/market";
+import {
+  MARKET_INTERVAL_CONFIG,
+  isMarketInterval,
+  type InstrumentData,
+  type MarketBar,
+  type MarketInterval,
+  type MarketSession,
+} from "@/lib/market";
 
 export const dynamic = "force-dynamic";
 
-const ALLOWED_INTERVALS = new Set(["1m", "5m"]);
 const SYMBOL_PATTERN = /^[A-Z0-9.^=-]{1,15}$/;
 
 type YahooMeta = {
@@ -47,7 +53,36 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-function sessionForTimestamp(timestamp: number, meta: YahooMeta): MarketBar["session"] {
+function sessionFromClock(timestamp: number, timezone: string): MarketBar["session"] {
+  try {
+    const parts = Object.fromEntries(
+      new Intl.DateTimeFormat("en-US", {
+        timeZone: timezone,
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+      })
+        .formatToParts(timestamp * 1000)
+        .filter((part) => part.type !== "literal")
+        .map((part) => [part.type, part.value]),
+    );
+    const minutes = Number(parts.hour) * 60 + Number(parts.minute);
+    if (minutes >= 570 && minutes < 960) return "regular";
+    if (minutes >= 240 && minutes < 570) return "pre";
+    if (minutes >= 960 && minutes < 1_200) return "post";
+  } catch {
+    return "unknown";
+  }
+  return "unknown";
+}
+
+function sessionForTimestamp(
+  timestamp: number,
+  meta: YahooMeta,
+  interval: MarketInterval,
+  includePrePost: boolean,
+): MarketBar["session"] {
+  if (interval === "1d") return "regular";
   const periods = meta.currentTradingPeriod;
   if (
     periods?.regular?.start &&
@@ -73,7 +108,11 @@ function sessionForTimestamp(timestamp: number, meta: YahooMeta): MarketBar["ses
   ) {
     return "post";
   }
-  return "unknown";
+  if (!includePrePost) return "regular";
+  return sessionFromClock(
+    timestamp,
+    meta.exchangeTimezoneName ?? "America/New_York",
+  );
 }
 
 function marketState(meta: YahooMeta): MarketSession {
@@ -108,13 +147,14 @@ function marketState(meta: YahooMeta): MarketSession {
 
 async function fetchInstrument(
   symbol: string,
-  interval: "1m" | "5m",
+  interval: MarketInterval,
   includePrePost: boolean,
 ): Promise<InstrumentData> {
+  const intervalConfig = MARKET_INTERVAL_CONFIG[interval];
   const params = new URLSearchParams({
-    range: "1d",
+    range: intervalConfig.chartRange,
     interval,
-    includePrePost: String(includePrePost),
+    includePrePost: String(includePrePost && interval !== "1d"),
     events: "div,splits",
   });
   const url = `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?${params}`;
@@ -163,7 +203,7 @@ async function fetchInstrument(
       low,
       close,
       volume: isFiniteNumber(volume) ? volume : 0,
-      session: sessionForTimestamp(time, meta),
+      session: sessionForTimestamp(time, meta, interval, includePrePost),
     });
   });
 
@@ -208,11 +248,12 @@ async function fetchInstrument(
 
 function makePreviewInstrument(
   symbol: string,
-  interval: "1m" | "5m",
+  interval: MarketInterval,
   symbolIndex: number,
 ): InstrumentData {
-  const step = interval === "1m" ? 60 : 300;
-  const count = interval === "1m" ? 180 : 78;
+  const intervalConfig = MARKET_INTERVAL_CONFIG[interval];
+  const step = intervalConfig.seconds;
+  const count = intervalConfig.previewBars;
   const basePrices: Record<string, number> = {
     MRVL: 238.9,
     AVGO: 381.4,
@@ -238,7 +279,7 @@ function makePreviewInstrument(
       low: Math.min(open, close) - spread * 0.82,
       close,
       volume: Math.round(
-        (interval === "1m" ? 115000 : 490000) *
+        intervalConfig.previewVolume *
           (0.72 + (index % 9) * 0.07) *
           (index > count - 8 ? 1.35 : 1),
       ),
@@ -269,9 +310,7 @@ function makePreviewInstrument(
 export async function GET(request: Request) {
   const url = new URL(request.url);
   const intervalParam = url.searchParams.get("interval") ?? "5m";
-  const interval = ALLOWED_INTERVALS.has(intervalParam)
-    ? (intervalParam as "1m" | "5m")
-    : "5m";
+  const interval = isMarketInterval(intervalParam) ? intervalParam : "5m";
   const includePrePost = url.searchParams.get("prepost") === "1";
   const symbols = (url.searchParams.get("symbols") ?? "MRVL,AVGO,NVDA,CRDO,LITE")
     .split(",")

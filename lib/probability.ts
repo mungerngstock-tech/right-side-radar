@@ -1,4 +1,9 @@
-import type { DirectionProbability, MarketBar } from "@/lib/market";
+import {
+  MARKET_INTERVAL_CONFIG,
+  type DirectionProbability,
+  type MarketBar,
+  type MarketInterval,
+} from "@/lib/market";
 
 type FeaturePoint = {
   index: number;
@@ -54,39 +59,43 @@ function sessionFormatter(timezone: string) {
   }
 }
 
-function buildFeatures(bars: MarketBar[], timezone: string) {
+function buildFeatures(
+  bars: MarketBar[],
+  timezone: string,
+  interval: MarketInterval,
+) {
   const formatter = sessionFormatter(timezone);
   const features: FeaturePoint[] = [];
   const sessions = bars.map((bar) => formatter.format(bar.time * 1000));
 
   let activeSession = "";
-  let sessionBars: MarketBar[] = [];
-  let sessionEma9: number[] = [];
-  let volumes: number[] = [];
-  let trueRanges: number[] = [];
+  const seriesBars: MarketBar[] = [];
+  const ema9Series: number[] = [];
+  const volumes: number[] = [];
+  const trueRanges: number[] = [];
   let ema9 = 0;
   let ema20 = 0;
   let vwapNumerator = 0;
   let vwapVolume = 0;
+  const vwapWindow: Array<{ weightedPrice: number; volume: number }> = [];
 
   bars.forEach((bar, index) => {
     const session = sessions[index];
-    if (session !== activeSession) {
-      activeSession = session;
-      sessionBars = [];
-      sessionEma9 = [];
-      volumes = [];
-      trueRanges = [];
+    if (!seriesBars.length) {
       ema9 = bar.close;
       ema20 = bar.close;
-      vwapNumerator = 0;
-      vwapVolume = 0;
     } else {
       ema9 = bar.close * (2 / 10) + ema9 * (1 - 2 / 10);
       ema20 = bar.close * (2 / 21) + ema20 * (1 - 2 / 21);
     }
 
-    const previousClose = sessionBars.at(-1)?.close ?? bar.open;
+    if (interval !== "1d" && session !== activeSession) {
+      activeSession = session;
+      vwapNumerator = 0;
+      vwapVolume = 0;
+    }
+
+    const previousClose = seriesBars.at(-1)?.close ?? bar.open;
     const trueRange = Math.max(
       bar.high - bar.low,
       Math.abs(bar.high - previousClose),
@@ -96,24 +105,35 @@ function buildFeatures(bars: MarketBar[], timezone: string) {
     if (trueRanges.length > 14) trueRanges.shift();
 
     const typicalPrice = (bar.high + bar.low + bar.close) / 3;
-    vwapNumerator += typicalPrice * bar.volume;
+    const weightedPrice = typicalPrice * bar.volume;
+    vwapNumerator += weightedPrice;
     vwapVolume += bar.volume;
+    if (interval === "1d") {
+      vwapWindow.push({ weightedPrice, volume: bar.volume });
+      if (vwapWindow.length > 20) {
+        const removed = vwapWindow.shift();
+        if (removed) {
+          vwapNumerator -= removed.weightedPrice;
+          vwapVolume -= removed.volume;
+        }
+      }
+    }
     const vwap = vwapVolume > 0 ? vwapNumerator / vwapVolume : bar.close;
     const atr = trueRanges.length >= 14 ? average(trueRanges) : 0;
     const previousVolumes = volumes.slice(-20).filter((value) => value > 0);
     const volumeAverage = previousVolumes.length ? average(previousVolumes) : 0;
     const relativeVolume =
       volumeAverage > 0 && bar.volume > 0 ? bar.volume / volumeAverage : 1;
-    const priorTwenty = sessionBars.slice(-20);
+    const priorTwenty = seriesBars.slice(-20);
     const pivot = priorTwenty.length
       ? Math.max(...priorTwenty.map((item) => item.high))
       : bar.high;
     const range = Math.max(bar.high - bar.low, Number.EPSILON);
-    const ema9ThreeBarsAgo = sessionEma9.at(-3);
-    const momentumBase = sessionBars.at(-3)?.close;
+    const ema9ThreeBarsAgo = ema9Series.at(-3);
+    const momentumBase = seriesBars.at(-3)?.close;
 
     if (
-      sessionBars.length >= 20 &&
+      seriesBars.length >= 20 &&
       atr > 0 &&
       ema9ThreeBarsAgo !== undefined &&
       momentumBase !== undefined
@@ -134,8 +154,8 @@ function buildFeatures(bars: MarketBar[], timezone: string) {
       });
     }
 
-    sessionBars.push(bar);
-    sessionEma9.push(ema9);
+    seriesBars.push(bar);
+    ema9Series.push(ema9);
     volumes.push(bar.volume);
   });
 
@@ -157,6 +177,14 @@ function distance(left: FeaturePoint, right: FeaturePoint) {
   return Math.sqrt(squared + breakoutPenalty ** 2 + candlePenalty ** 2);
 }
 
+function flatThreshold(atr: number, close: number, interval: MarketInterval) {
+  const raw = (atr / close) * (interval === "1d" ? 0.35 : 0.3);
+  if (interval === "1d") return clamp(raw, 0.003, 0.03);
+  if (interval === "30m") return clamp(raw, 0.001, 0.008);
+  if (interval === "15m") return clamp(raw, 0.0008, 0.006);
+  return clamp(raw, 0.0006, 0.004);
+}
+
 export function calculateDirectionProbability({
   symbol,
   interval,
@@ -164,36 +192,37 @@ export function calculateDirectionProbability({
   timezone,
 }: {
   symbol: string;
-  interval: "1m" | "5m";
+  interval: MarketInterval;
   bars: MarketBar[];
   timezone: string;
 }): DirectionProbability {
-  const horizonBars = interval === "1m" ? 15 : 6;
-  const horizonMinutes = interval === "1m" ? 15 : 30;
-  const { features, sessions } = buildFeatures(bars, timezone);
+  const { horizonBars, horizonMinutes } = MARKET_INTERVAL_CONFIG[interval];
+  const { features, sessions } = buildFeatures(bars, timezone, interval);
   const current = features.at(-1);
 
   if (!current || current.index < bars.length - 2) {
-    throw new Error("當日完整 K 線不足 20 根，暫不能估計方向概率");
+    throw new Error("完整 K 線不足，暫不能估計方向概率");
   }
 
   const candidates: Neighbor[] = [];
   for (const candidate of features) {
     const futureIndex = candidate.index + horizonBars;
     if (futureIndex >= current.index) continue;
-    if (sessions[futureIndex] !== candidate.session) continue;
+    if (interval !== "1d" && sessions[futureIndex] !== candidate.session) continue;
     const future = bars[futureIndex];
     if (!future) continue;
-    const elapsedSeconds = future.time - bars[candidate.index].time;
-    const targetSeconds = horizonMinutes * 60;
-    if (
-      elapsedSeconds < targetSeconds * 0.75 ||
-      elapsedSeconds > targetSeconds * 1.5
-    ) {
-      continue;
+    if (interval !== "1d") {
+      const elapsedSeconds = future.time - bars[candidate.index].time;
+      const targetSeconds = horizonMinutes * 60;
+      if (
+        elapsedSeconds < targetSeconds * 0.75 ||
+        elapsedSeconds > targetSeconds * 1.5
+      ) {
+        continue;
+      }
     }
     const outcome = future.close / candidate.close - 1;
-    const threshold = clamp((candidate.atr / candidate.close) * 0.3, 0.0006, 0.004);
+    const threshold = flatThreshold(candidate.atr, candidate.close, interval);
     candidates.push({
       distance: distance(current, candidate),
       outcome,
@@ -207,14 +236,13 @@ export function calculateDirectionProbability({
     throw new Error("歷史可比片段不足 30 個，暫不能估計方向概率");
   }
 
-  const neighborLimit = interval === "1m" ? 150 : 180;
+  const neighborLimit = interval === "1m" ? 150 : interval === "1d" ? 200 : 180;
   const neighbors = candidates
     .sort((left, right) => left.distance - right.distance)
     .slice(0, neighborLimit);
 
   let upWeight = 0;
   let flatWeight = 0;
-  let downWeight = 0;
   let totalWeight = 0;
   let squaredWeight = 0;
   let weightedOutcome = 0;
@@ -223,8 +251,7 @@ export function calculateDirectionProbability({
     const weight =
       Math.exp(-neighbor.distance * 0.8) * (0.7 + 0.3 * neighbor.recency);
     if (neighbor.outcome > neighbor.threshold) upWeight += weight;
-    else if (neighbor.outcome < -neighbor.threshold) downWeight += weight;
-    else flatWeight += weight;
+    else if (neighbor.outcome >= -neighbor.threshold) flatWeight += weight;
     totalWeight += weight;
     squaredWeight += weight * weight;
     weightedOutcome += neighbor.outcome * weight;
@@ -240,7 +267,7 @@ export function calculateDirectionProbability({
   const absoluteMoves = neighbors
     .map((neighbor) => Math.abs(neighbor.outcome) * 100)
     .sort((left, right) => left - right);
-  const currentFlatBand = clamp((current.atr / current.close) * 0.3, 0.0006, 0.004);
+  const currentFlatBand = flatThreshold(current.atr, current.close, interval);
 
   return {
     symbol,

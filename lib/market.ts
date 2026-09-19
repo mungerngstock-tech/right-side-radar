@@ -1,5 +1,90 @@
 export type MarketSession = "PRE" | "REGULAR" | "POST" | "CLOSED";
 
+export const MARKET_INTERVALS = ["1m", "5m", "15m", "30m", "1d"] as const;
+
+export type MarketInterval = (typeof MARKET_INTERVALS)[number];
+
+export const MARKET_INTERVAL_CONFIG: Record<
+  MarketInterval,
+  {
+    label: string;
+    seconds: number;
+    chartRange: string;
+    historyRange: string;
+    historyLabel: string;
+    horizonBars: number;
+    horizonMinutes: number;
+    previewBars: number;
+    previewVolume: number;
+    staleAfterSeconds: number;
+  }
+> = {
+  "1m": {
+    label: "1 分鐘",
+    seconds: 60,
+    chartRange: "1d",
+    historyRange: "7d",
+    historyLabel: "7 日",
+    horizonBars: 15,
+    horizonMinutes: 15,
+    previewBars: 180,
+    previewVolume: 115_000,
+    staleAfterSeconds: 180,
+  },
+  "5m": {
+    label: "5 分鐘",
+    seconds: 300,
+    chartRange: "1d",
+    historyRange: "60d",
+    historyLabel: "60 日",
+    horizonBars: 6,
+    horizonMinutes: 30,
+    previewBars: 78,
+    previewVolume: 490_000,
+    staleAfterSeconds: 480,
+  },
+  "15m": {
+    label: "15 分鐘",
+    seconds: 900,
+    chartRange: "5d",
+    historyRange: "60d",
+    historyLabel: "60 日",
+    horizonBars: 4,
+    horizonMinutes: 60,
+    previewBars: 100,
+    previewVolume: 1_400_000,
+    staleAfterSeconds: 1_800,
+  },
+  "30m": {
+    label: "30 分鐘",
+    seconds: 1_800,
+    chartRange: "1mo",
+    historyRange: "60d",
+    historyLabel: "60 日",
+    horizonBars: 4,
+    horizonMinutes: 120,
+    previewBars: 96,
+    previewVolume: 2_800_000,
+    staleAfterSeconds: 3_600,
+  },
+  "1d": {
+    label: "1 日",
+    seconds: 86_400,
+    chartRange: "6mo",
+    historyRange: "5y",
+    historyLabel: "5 年",
+    horizonBars: 5,
+    horizonMinutes: 7_200,
+    previewBars: 120,
+    previewVolume: 35_000_000,
+    staleAfterSeconds: 172_800,
+  },
+};
+
+export function isMarketInterval(value: unknown): value is MarketInterval {
+  return MARKET_INTERVALS.includes(value as MarketInterval);
+}
+
 export type MarketBar = {
   time: number;
   open: number;
@@ -34,7 +119,7 @@ export type MarketApiResponse = {
 
 export type DirectionProbability = {
   symbol: string;
-  interval: "1m" | "5m";
+  interval: MarketInterval;
   horizonMinutes: number;
   upProbability: number;
   flatProbability: number;
@@ -116,7 +201,69 @@ function ema(values: number[], period: number) {
   return result;
 }
 
-export function buildIndicators(bars: MarketBar[]): IndicatorPoint[] {
+function makeTradingDateFormatter(timezone: string) {
+  try {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: timezone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  } catch {
+    return new Intl.DateTimeFormat("en-CA", {
+      timeZone: "America/New_York",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+  }
+}
+
+function localDateAndMinutes(timestampMs: number, timezone: string) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  });
+  const parts = Object.fromEntries(
+    formatter
+      .formatToParts(timestampMs)
+      .filter((part) => part.type !== "literal")
+      .map((part) => [part.type, part.value]),
+  );
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minutes: Number(parts.hour) * 60 + Number(parts.minute),
+  };
+}
+
+export function isBarLikelyPartial(
+  barTime: number,
+  fetchedAt: number,
+  interval: MarketInterval,
+  timezone: string,
+) {
+  if (interval !== "1d") {
+    return fetchedAt / 1000 < barTime + MARKET_INTERVAL_CONFIG[interval].seconds;
+  }
+  try {
+    const barLocal = localDateAndMinutes(barTime * 1000, timezone);
+    const fetchedLocal = localDateAndMinutes(fetchedAt, timezone);
+    return barLocal.date === fetchedLocal.date && fetchedLocal.minutes < 16 * 60;
+  } catch {
+    return fetchedAt / 1000 < barTime + MARKET_INTERVAL_CONFIG[interval].seconds;
+  }
+}
+
+export function buildIndicators(
+  bars: MarketBar[],
+  interval: MarketInterval = "5m",
+  timezone = "America/New_York",
+): IndicatorPoint[] {
   const ema9 = ema(
     bars.map((bar) => bar.close),
     9,
@@ -129,13 +276,35 @@ export function buildIndicators(bars: MarketBar[]): IndicatorPoint[] {
   let vwapNumerator = 0;
   let vwapVolume = 0;
   let sawRegularBar = false;
+  let activeDate = "";
+  const tradingDate = makeTradingDateFormatter(timezone);
+  const dailyVwapWindow: Array<{ weightedPrice: number; volume: number }> = [];
 
   return bars.map((bar, index) => {
-    if (bar.session === "regular") {
+    const date = tradingDate.format(bar.time * 1000);
+    if (interval !== "1d" && date !== activeDate) {
+      activeDate = date;
+      vwapNumerator = 0;
+      vwapVolume = 0;
+      sawRegularBar = false;
+    }
+
+    if (interval === "1d" || bar.session === "regular") {
       sawRegularBar = true;
       const typical = (bar.high + bar.low + bar.close) / 3;
-      vwapNumerator += typical * bar.volume;
+      const weightedPrice = typical * bar.volume;
+      vwapNumerator += weightedPrice;
       vwapVolume += bar.volume;
+      if (interval === "1d") {
+        dailyVwapWindow.push({ weightedPrice, volume: bar.volume });
+        if (dailyVwapWindow.length > 20) {
+          const removed = dailyVwapWindow.shift();
+          if (removed) {
+            vwapNumerator -= removed.weightedPrice;
+            vwapVolume -= removed.volume;
+          }
+        }
+      }
     }
 
     return {
@@ -174,13 +343,18 @@ function formatLevel(value: number | null) {
 
 export function analyseInstrument(
   instrument: InstrumentData,
-  interval: "1m" | "5m",
+  interval: MarketInterval,
 ): MarketAnalysis {
-  const intervalSeconds = interval === "1m" ? 60 : 300;
-  const points = buildIndicators(instrument.bars);
+  const points = buildIndicators(instrument.bars, interval, instrument.timezone);
   const newest = points.at(-1);
   const newestIsPartial = Boolean(
-    newest && instrument.fetchedAt / 1000 < newest.time + intervalSeconds,
+    newest &&
+      isBarLikelyPartial(
+        newest.time,
+        instrument.fetchedAt,
+        interval,
+        instrument.timezone,
+      ),
   );
   const complete = newestIsPartial ? points.slice(0, -1) : points;
 
@@ -239,14 +413,15 @@ export function analyseInstrument(
     closeLocation < 0.6;
   const extensionAtr =
     atr && currentVwap !== null ? (last.close - currentVwap) / atr : null;
+  const vwapLabel = interval === "1d" ? "20 日量價均線" : "VWAP";
 
   const checks: SignalCheck[] = [
     {
       key: "vwap",
-      label: "價格站上 VWAP",
+      label: `價格站上 ${vwapLabel}`,
       detail:
         currentVwap === null
-          ? "VWAP 尚未形成"
+          ? `${vwapLabel}尚未形成`
           : `${formatLevel(last.close)} vs ${formatLevel(currentVwap)}`,
       passed: currentVwap !== null && last.close > currentVwap,
     },
@@ -317,7 +492,7 @@ export function analyseInstrument(
 
   const risks: string[] = [];
   if (extensionAtr !== null && extensionAtr > 1.5) {
-    risks.push(`價格已高於 VWAP ${extensionAtr.toFixed(1)} ATR，追價風險偏高。`);
+    risks.push(`價格已高於${vwapLabel} ${extensionAtr.toFixed(1)} ATR，追價風險偏高。`);
   }
   if (falseBreakout) risks.push("價格曾越過關鍵位但收回其下，買盤未能守住成果。");
   if (effortNoResult) risks.push("成交量明顯放大，但實體與收盤位置偏弱，留意上方供給。");
@@ -339,11 +514,11 @@ export function analyseInstrument(
 
   const nextStep =
     status === "右側確認"
-      ? `觀察下一根能否續守 ${formatLevel(pivot)}；若離 VWAP 過遠，等回踩而非追價。`
+      ? `觀察下一根能否續守 ${formatLevel(pivot)}；若離${vwapLabel}過遠，等回踩而非追價。`
       : `等待完整 K 線放量收上 ${formatLevel(pivot)}，再看下一根是否守住。`;
   const invalidation =
     currentVwap !== null && currentEma20 !== null
-      ? `若收盤跌回 VWAP ${formatLevel(currentVwap)} 下方，且 EMA 9 下穿 EMA 20 ${formatLevel(currentEma20)}，本輪右側結構失效。`
+      ? `若收盤跌回${vwapLabel} ${formatLevel(currentVwap)} 下方，且 EMA 9 下穿 EMA 20 ${formatLevel(currentEma20)}，本輪右側結構失效。`
       : `若再次跌破關鍵位 ${formatLevel(pivot)} 並放量，視為結構失效。`;
 
   return {

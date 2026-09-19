@@ -1,7 +1,11 @@
-import type {
-  DirectionProbability,
-  MarketBar,
-  ProbabilityApiResponse,
+import {
+  MARKET_INTERVAL_CONFIG,
+  isBarLikelyPartial,
+  isMarketInterval,
+  type DirectionProbability,
+  type MarketBar,
+  type MarketInterval,
+  type ProbabilityApiResponse,
 } from "@/lib/market";
 import { calculateDirectionProbability } from "@/lib/probability";
 
@@ -27,9 +31,10 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
-async function fetchHistory(symbol: string, interval: "1m" | "5m") {
+async function fetchHistory(symbol: string, interval: MarketInterval) {
+  const intervalConfig = MARKET_INTERVAL_CONFIG[interval];
   const params = new URLSearchParams({
-    range: interval === "1m" ? "7d" : "60d",
+    range: intervalConfig.historyRange,
     interval,
     includePrePost: "false",
     events: "div,splits",
@@ -90,10 +95,15 @@ async function fetchHistory(symbol: string, interval: "1m" | "5m") {
     });
   });
 
-  const intervalSeconds = interval === "1m" ? 60 : 300;
+  const timezone = result.meta?.exchangeTimezoneName ?? "America/New_York";
   if (
     bars.length > 1 &&
-    Date.now() / 1000 < (bars.at(-1)?.time ?? 0) + intervalSeconds
+    isBarLikelyPartial(
+      bars.at(-1)?.time ?? 0,
+      Date.now(),
+      interval,
+      timezone,
+    )
   ) {
     bars.pop();
   }
@@ -103,7 +113,7 @@ async function fetchHistory(symbol: string, interval: "1m" | "5m") {
     symbol,
     interval,
     bars,
-    timezone: result.meta?.exchangeTimezoneName ?? "America/New_York",
+    timezone,
   });
 }
 
@@ -113,7 +123,7 @@ function roundPreview(value: number) {
 
 function makePreviewProbability(
   symbol: string,
-  interval: "1m" | "5m",
+  interval: MarketInterval,
   index: number,
 ): DirectionProbability {
   const seed = [...symbol].reduce(
@@ -122,19 +132,66 @@ function makePreviewProbability(
   );
   const upProbability = 43 + ((seed + index * 3) % 8);
   const downProbability = 28 + ((seed + index * 5) % 8);
+  const previewStats: Record<
+    MarketInterval,
+    {
+      sampleSize: number;
+      effectiveSampleSize: number;
+      medianAbsoluteMovePercent: number;
+      flatBandPercent: number;
+      historySessions: number;
+    }
+  > = {
+    "1m": {
+      sampleSize: 150,
+      effectiveSampleSize: 73,
+      medianAbsoluteMovePercent: 0.42,
+      flatBandPercent: 0.09,
+      historySessions: 5,
+    },
+    "5m": {
+      sampleSize: 180,
+      effectiveSampleSize: 88,
+      medianAbsoluteMovePercent: 0.68,
+      flatBandPercent: 0.13,
+      historySessions: 37,
+    },
+    "15m": {
+      sampleSize: 180,
+      effectiveSampleSize: 90,
+      medianAbsoluteMovePercent: 0.95,
+      flatBandPercent: 0.18,
+      historySessions: 45,
+    },
+    "30m": {
+      sampleSize: 180,
+      effectiveSampleSize: 92,
+      medianAbsoluteMovePercent: 1.2,
+      flatBandPercent: 0.25,
+      historySessions: 52,
+    },
+    "1d": {
+      sampleSize: 200,
+      effectiveSampleSize: 105,
+      medianAbsoluteMovePercent: 4.8,
+      flatBandPercent: 1,
+      historySessions: 190,
+    },
+  };
+  const stats = previewStats[interval];
   return {
     symbol,
     interval,
-    horizonMinutes: interval === "1m" ? 15 : 30,
+    horizonMinutes: MARKET_INTERVAL_CONFIG[interval].horizonMinutes,
     upProbability,
     flatProbability: 100 - upProbability - downProbability,
     downProbability,
-    sampleSize: interval === "1m" ? 150 : 180,
-    effectiveSampleSize: interval === "1m" ? 73 : 88,
+    sampleSize: stats.sampleSize,
+    effectiveSampleSize: stats.effectiveSampleSize,
     expectedMovePercent: roundPreview(((seed % 7) - 2) * 0.04),
-    medianAbsoluteMovePercent: interval === "1m" ? 0.42 : 0.68,
-    flatBandPercent: interval === "1m" ? 0.09 : 0.13,
-    historySessions: interval === "1m" ? 5 : 37,
+    medianAbsoluteMovePercent: stats.medianAbsoluteMovePercent,
+    flatBandPercent: stats.flatBandPercent,
+    historySessions: stats.historySessions,
     dataThrough: Math.floor(Date.now() / 1000),
     generatedAt: Date.now(),
     status: "ready",
@@ -144,7 +201,8 @@ function makePreviewProbability(
 
 export async function GET(request: Request) {
   const url = new URL(request.url);
-  const interval = url.searchParams.get("interval") === "1m" ? "1m" : "5m";
+  const intervalParam = url.searchParams.get("interval") ?? "5m";
+  const interval = isMarketInterval(intervalParam) ? intervalParam : "5m";
   const symbols = (
     url.searchParams.get("symbols") ??
     url.searchParams.get("symbol") ??

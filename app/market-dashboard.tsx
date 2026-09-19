@@ -58,11 +58,15 @@ import { cn } from "@/lib/utils";
 import {
   analyseInstrument,
   buildIndicators,
+  isMarketInterval,
+  MARKET_INTERVAL_CONFIG,
+  MARKET_INTERVALS,
   type DirectionProbability,
   type IndicatorPoint,
   type InstrumentData,
   type MarketAnalysis,
   type MarketApiResponse,
+  type MarketInterval,
   type ProbabilityApiResponse,
   type SignalTone,
 } from "@/lib/market";
@@ -71,11 +75,9 @@ const DEFAULT_SYMBOLS = ["MRVL", "AVGO", "NVDA", "CRDO", "LITE"];
 const STORAGE_KEY = "right-side-radar-settings-v1";
 const REFRESH_SECONDS = 30;
 
-type Interval = "1m" | "5m";
-
 type StoredSettings = {
   symbols: string[];
-  interval: Interval;
+  interval: MarketInterval;
   prepost: boolean;
 };
 
@@ -98,13 +100,36 @@ function formatVolume(value: number) {
   }).format(value);
 }
 
-function formatTime(timestamp: number, timezone = "America/New_York") {
+function formatChartTime(
+  timestamp: number,
+  timezone: string,
+  interval: MarketInterval,
+  detailed = false,
+) {
+  const showDate = interval === "1d" || interval === "15m" || interval === "30m";
   return new Intl.DateTimeFormat("zh-Hant", {
     timeZone: timezone,
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
+    ...(showDate || detailed
+      ? {
+          year: interval === "1d" && detailed ? ("numeric" as const) : undefined,
+          month: "2-digit" as const,
+          day: "2-digit" as const,
+        }
+      : {}),
+    ...(interval === "1d"
+      ? {}
+      : {
+          hour: "2-digit" as const,
+          minute: "2-digit" as const,
+          hour12: false,
+        }),
   }).format(timestamp * 1000);
+}
+
+function formatHorizon(minutes: number, interval: MarketInterval) {
+  if (interval === "1d") return `${minutes / 1_440} 個交易日`;
+  if (minutes >= 60 && minutes % 60 === 0) return `${minutes / 60} 小時`;
+  return `${minutes} 分鐘`;
 }
 
 function marketStateLabel(state: InstrumentData["marketState"]) {
@@ -275,15 +300,31 @@ function WatchCard({
 function PriceChart({
   instrument,
   analysis,
+  interval,
 }: {
   instrument: InstrumentData;
   analysis: MarketAnalysis;
+  interval: MarketInterval;
 }) {
-  const points = useMemo(() => buildIndicators(instrument.bars), [instrument.bars]);
-  const visible = points.slice(-96);
+  const points = useMemo(
+    () => buildIndicators(instrument.bars, interval, instrument.timezone),
+    [instrument.bars, instrument.timezone, interval],
+  );
+  const visible = points.slice(-MARKET_INTERVAL_CONFIG[interval].previewBars);
+  const [activeTime, setActiveTime] = useState<number | null>(null);
+  const activePoint =
+    activeTime === null
+      ? null
+      : visible.find((point) => point.time === activeTime) ?? null;
+  const chartSyncId = `price-volume-${instrument.symbol}-${interval}`;
   const low = Math.min(...visible.map((point) => point.low));
   const high = Math.max(...visible.map((point) => point.high));
   const padding = Math.max((high - low) * 0.08, high * 0.001);
+
+  const handleChartMove = (state: { activeLabel?: string | number } | null) => {
+    const nextTime = Number(state?.activeLabel);
+    setActiveTime(Number.isFinite(nextTime) ? nextTime : null);
+  };
 
   return (
     <div>
@@ -291,7 +332,10 @@ function PriceChart({
         config={{
           ema9: { label: "EMA 9", color: "#60a5fa" },
           ema20: { label: "EMA 20", color: "#a78bfa" },
-          vwap: { label: "VWAP", color: "#fbbf24" },
+          vwap: {
+            label: interval === "1d" ? "20 日量價均線" : "VWAP",
+            color: "#fbbf24",
+          },
         }}
         className="h-[330px] w-full aspect-auto"
         initialDimension={{ width: 760, height: 330 }}
@@ -299,6 +343,10 @@ function PriceChart({
         <ComposedChart
           data={visible}
           margin={{ top: 10, right: 8, bottom: 2, left: 0 }}
+          syncId={chartSyncId}
+          syncMethod="value"
+          onMouseMove={handleChartMove}
+          onMouseLeave={() => setActiveTime(null)}
         >
           <CartesianGrid
             strokeDasharray="2 6"
@@ -310,7 +358,9 @@ function PriceChart({
             minTickGap={48}
             tickLine={false}
             axisLine={false}
-            tickFormatter={(value) => formatTime(Number(value), instrument.timezone)}
+            tickFormatter={(value) =>
+              formatChartTime(Number(value), instrument.timezone, interval)
+            }
             tick={{ fill: "#64748b", fontSize: 11 }}
           />
           <YAxis
@@ -323,12 +373,15 @@ function PriceChart({
             tick={{ fill: "#64748b", fontSize: 11 }}
           />
           <ChartTooltip
+            cursor={false}
             content={
               <ChartTooltipContent
                 className="border-white/10 bg-[#0a1320] text-slate-200"
                 labelFormatter={(_, payload) => {
                   const time = payload?.[0]?.payload?.time;
-                  return time ? formatTime(time, instrument.timezone) : "";
+                  return time
+                    ? formatChartTime(time, instrument.timezone, interval, true)
+                    : "";
                 }}
                 formatter={(value, name) => (
                   <div className="flex min-w-32 items-center justify-between gap-4">
@@ -383,32 +436,98 @@ function PriceChart({
               strokeOpacity={0.75}
             />
           ) : null}
+          {activeTime !== null ? (
+            <ReferenceLine
+              x={activeTime}
+              stroke="#e2e8f0"
+              strokeDasharray="3 4"
+              strokeOpacity={0.7}
+            />
+          ) : null}
         </ComposedChart>
       </ChartContainer>
 
+      <div className="mt-1 flex h-6 items-center justify-between px-1 text-xs text-slate-500">
+        <span>成交量</span>
+        <span className="font-mono tabular-nums text-slate-300">
+          {activePoint
+            ? `${formatChartTime(activePoint.time, instrument.timezone, interval, true)} · ${formatVolume(activePoint.volume)}`
+            : "指向 K 線查看對應柱"}
+        </span>
+      </div>
       <ChartContainer
         config={{ volume: { label: "成交量", color: "#334155" } }}
-        className="mt-1 h-[92px] w-full aspect-auto"
+        className="h-[92px] w-full aspect-auto"
         initialDimension={{ width: 760, height: 92 }}
       >
         <ComposedChart
           data={visible}
           margin={{ top: 0, right: 8, bottom: 0, left: 0 }}
+          syncId={chartSyncId}
+          syncMethod="value"
+          onMouseMove={handleChartMove}
+          onMouseLeave={() => setActiveTime(null)}
         >
           <XAxis dataKey="time" hide />
-          <YAxis orientation="right" hide />
-          <Bar dataKey="volume" isAnimationActive={false} maxBarSize={8}>
-            {visible.map((bar) => (
-              <Cell
-                key={bar.time}
-                fill={
-                  bar.close >= bar.open
-                    ? "rgba(45,212,191,.45)"
-                    : "rgba(251,113,133,.45)"
-                }
+          <YAxis
+            orientation="right"
+            width={58}
+            tick={false}
+            tickLine={false}
+            axisLine={false}
+          />
+          <ChartTooltip
+            cursor={false}
+            content={
+              <ChartTooltipContent
+                className="border-white/10 bg-[#0a1320] text-slate-200"
+                labelFormatter={(_, payload) => {
+                  const time = payload?.[0]?.payload?.time;
+                  return time
+                    ? formatChartTime(time, instrument.timezone, interval, true)
+                    : "";
+                }}
+                formatter={(value) => (
+                  <div className="flex min-w-32 items-center justify-between gap-4">
+                    <span className="text-slate-400">成交量</span>
+                    <span className="font-mono text-slate-100">
+                      {formatVolume(Number(value))}
+                    </span>
+                  </div>
+                )}
               />
-            ))}
+            }
+          />
+          <Bar dataKey="volume" isAnimationActive={false} maxBarSize={8}>
+            {visible.map((bar) => {
+              const isActive = bar.time === activeTime;
+              const rising = bar.close >= bar.open;
+              return (
+                <Cell
+                  key={bar.time}
+                  fill={
+                    rising
+                      ? isActive
+                        ? "rgba(45,212,191,.95)"
+                        : "rgba(45,212,191,.45)"
+                      : isActive
+                        ? "rgba(251,113,133,.95)"
+                        : "rgba(251,113,133,.45)"
+                  }
+                  stroke={isActive ? "#e2e8f0" : "transparent"}
+                  strokeWidth={isActive ? 1.25 : 0}
+                />
+              );
+            })}
           </Bar>
+          {activeTime !== null ? (
+            <ReferenceLine
+              x={activeTime}
+              stroke="#e2e8f0"
+              strokeDasharray="3 4"
+              strokeOpacity={0.7}
+            />
+          ) : null}
         </ComposedChart>
       </ChartContainer>
     </div>
@@ -424,7 +543,7 @@ function ProbabilityPanel({
   probability?: DirectionProbability;
   loading: boolean;
   error?: string;
-  interval: Interval;
+  interval: MarketInterval;
 }) {
   if (loading && !probability) {
     return (
@@ -488,7 +607,7 @@ function ProbabilityPanel({
           variant="outline"
           className="border-cyan-300/20 bg-cyan-300/5 text-cyan-200"
         >
-          未來 {probability.horizonMinutes} 分鐘
+          未來 {formatHorizon(probability.horizonMinutes, interval)}
         </Badge>
       </div>
 
@@ -539,7 +658,7 @@ function ProbabilityPanel({
       </div>
 
       <p className="mt-3 text-xs leading-5 text-slate-600">
-        {interval === "1m" ? "7 日" : "60 日"}歷史相似度估計；波動在 ±
+        {MARKET_INTERVAL_CONFIG[interval].historyLabel}歷史相似度估計；波動在 ±
         {probability.flatBandPercent.toFixed(2)}% 內列作橫行。概率不是保證，突發新聞不在模型內。
       </p>
     </div>
@@ -559,7 +678,7 @@ function AnalysisPanel({
   probability?: DirectionProbability;
   probabilityLoading: boolean;
   probabilityError?: string;
-  interval: Interval;
+  interval: MarketInterval;
 }) {
   return (
     <Card className="h-full border-white/8 bg-[#101b2b] shadow-none">
@@ -592,7 +711,7 @@ function AnalysisPanel({
 
         <div className="grid grid-cols-3 gap-2">
           {[
-            ["VWAP", formatPrice(analysis.vwap)],
+            [interval === "1d" ? "20 日量價均線" : "VWAP", formatPrice(analysis.vwap)],
             ["突破位", formatPrice(analysis.pivot)],
             [
               "相對量",
@@ -670,9 +789,11 @@ function AnalysisPanel({
         </div>
         <p className="border-t border-white/8 pt-3 text-xs leading-5 text-slate-600">
           判讀使用{" "}
-          {formatTime(
+          {formatChartTime(
             analysis.analysisTime ?? instrument.bars.at(-1)?.time ?? 0,
             instrument.timezone,
+            interval,
+            true,
           )}{" "}
           的最後完整 K 線；目前形成中的 K 線不計入量能確認。
         </p>
@@ -684,7 +805,7 @@ function AnalysisPanel({
 export function MarketDashboard() {
   const [symbols, setSymbols] = useState(DEFAULT_SYMBOLS);
   const [draftSymbols, setDraftSymbols] = useState(DEFAULT_SYMBOLS);
-  const [interval, setIntervalValue] = useState<Interval>("5m");
+  const [interval, setIntervalValue] = useState<MarketInterval>("5m");
   const [prepost, setPrepost] = useState(false);
   const [selected, setSelected] = useState(DEFAULT_SYMBOLS[0]);
   const [records, setRecords] = useState<Record<string, InstrumentData>>({});
@@ -708,6 +829,7 @@ export function MarketDashboard() {
   const probabilityRequestId = useRef(0);
 
   useEffect(() => {
+    let restoreTimer: number | undefined;
     try {
       const stored = JSON.parse(
         localStorage.getItem(STORAGE_KEY) ?? "null",
@@ -720,15 +842,22 @@ export function MarketDashboard() {
           /^[A-Z0-9.^=-]{1,15}$/.test(symbol),
         )
       ) {
-        setSymbols(stored.symbols);
-        setDraftSymbols(stored.symbols);
-        setSelected(stored.symbols[0]);
-        setIntervalValue(stored.interval === "1m" ? "1m" : "5m");
-        setPrepost(Boolean(stored.prepost));
+        restoreTimer = window.setTimeout(() => {
+          setSymbols(stored.symbols);
+          setDraftSymbols(stored.symbols);
+          setSelected(stored.symbols[0]);
+          setIntervalValue(
+            isMarketInterval(stored.interval) ? stored.interval : "5m",
+          );
+          setPrepost(Boolean(stored.prepost));
+        }, 0);
       }
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
+    return () => {
+      if (restoreTimer !== undefined) window.clearTimeout(restoreTimer);
+    };
   }, []);
 
   useEffect(() => {
@@ -786,7 +915,7 @@ export function MarketDashboard() {
   );
 
   useEffect(() => {
-    void loadMarket();
+    const initialTimer = window.setTimeout(() => void loadMarket(), 0);
     const refreshTimer = window.setInterval(
       () => void loadMarket(),
       REFRESH_SECONDS * 1000,
@@ -799,6 +928,7 @@ export function MarketDashboard() {
     };
     document.addEventListener("visibilitychange", handleVisibility);
     return () => {
+      window.clearTimeout(initialTimer);
       window.clearInterval(refreshTimer);
       window.clearInterval(countdownTimer);
       document.removeEventListener("visibilitychange", handleVisibility);
@@ -807,48 +937,53 @@ export function MarketDashboard() {
 
   useEffect(() => {
     const id = ++probabilityRequestId.current;
-    setProbabilityLoading(true);
-    setProbabilities({});
-    setProbabilityErrors({});
-    const query = new URLSearchParams({
-      symbols: symbols.join(","),
-      interval,
-    });
-
-    void fetch("/api/probability?" + query, { cache: "no-store" })
-      .then(async (response) => {
-        const payload = (await response.json()) as ProbabilityApiResponse & {
-          error?: string;
-        };
-        if (!response.ok && !payload.data?.length) {
-          throw new Error(
-            payload.error ??
-              payload.errors?.[0]?.message ??
-              "方向概率讀取失敗",
-          );
-        }
-        if (id !== probabilityRequestId.current) return;
-        setProbabilities(
-          Object.fromEntries(payload.data.map((item) => [item.symbol, item])),
-        );
-        setProbabilityErrors(
-          Object.fromEntries(
-            payload.errors.map((item) => [item.symbol, item.message]),
-          ),
-        );
-      })
-      .catch((error: unknown) => {
-        if (id !== probabilityRequestId.current) return;
-        const message =
-          error instanceof Error ? error.message : "方向概率讀取失敗";
-        setProbabilities({});
-        setProbabilityErrors(
-          Object.fromEntries(symbols.map((symbol) => [symbol, message])),
-        );
-      })
-      .finally(() => {
-        if (id === probabilityRequestId.current) setProbabilityLoading(false);
+    const requestTimer = window.setTimeout(() => {
+      setProbabilityLoading(true);
+      setProbabilities({});
+      setProbabilityErrors({});
+      const query = new URLSearchParams({
+        symbols: symbols.join(","),
+        interval,
       });
+
+      void fetch("/api/probability?" + query, { cache: "no-store" })
+        .then(async (response) => {
+          const payload = (await response.json()) as ProbabilityApiResponse & {
+            error?: string;
+          };
+          if (!response.ok && !payload.data?.length) {
+            throw new Error(
+              payload.error ??
+                payload.errors?.[0]?.message ??
+                "方向概率讀取失敗",
+            );
+          }
+          if (id !== probabilityRequestId.current) return;
+          setProbabilities(
+            Object.fromEntries(payload.data.map((item) => [item.symbol, item])),
+          );
+          setProbabilityErrors(
+            Object.fromEntries(
+              payload.errors.map((item) => [item.symbol, item.message]),
+            ),
+          );
+        })
+        .catch((error: unknown) => {
+          if (id !== probabilityRequestId.current) return;
+          const message =
+            error instanceof Error ? error.message : "方向概率讀取失敗";
+          setProbabilities({});
+          setProbabilityErrors(
+            Object.fromEntries(symbols.map((symbol) => [symbol, message])),
+          );
+        })
+        .finally(() => {
+          if (id === probabilityRequestId.current) setProbabilityLoading(false);
+        });
+    }, 0);
+    return () => {
+      window.clearTimeout(requestTimer);
+    };
   }, [symbols, interval, probabilityReload]);
 
   useEffect(() => {
@@ -946,11 +1081,12 @@ export function MarketDashboard() {
         {
           name: "set_chart_preferences",
           title: "設定圖表",
-          description: "設定 1 分鐘或 5 分鐘 K 線，以及是否顯示盤前盤後。",
+          description:
+            "設定 1、5、15、30 分鐘或 1 日 K 線，以及是否顯示盤前盤後。",
           inputSchema: {
             type: "object",
             properties: {
-              interval: { type: "string", enum: ["1m", "5m"] },
+              interval: { type: "string", enum: [...MARKET_INTERVALS] },
               includePrePost: { type: "boolean" },
             },
             required: ["interval", "includePrePost"],
@@ -965,8 +1101,8 @@ export function MarketDashboard() {
               interval?: unknown;
               includePrePost?: unknown;
             };
-            if (candidate.interval !== "1m" && candidate.interval !== "5m") {
-              throw new Error("interval 只可為 1m 或 5m");
+            if (!isMarketInterval(candidate.interval)) {
+              throw new Error("interval 只可為 1m、5m、15m、30m 或 1d");
             }
             if (typeof candidate.includePrePost !== "boolean") {
               throw new Error("includePrePost 必須為布林值");
@@ -1011,8 +1147,8 @@ export function MarketDashboard() {
   const stale = Boolean(
     active?.marketState === "REGULAR" &&
       active.bars.at(-1)?.time &&
-      Date.now() / 1000 - active.bars.at(-1)!.time >
-        (interval === "1m" ? 180 : 480),
+      active.fetchedAt / 1000 - active.bars.at(-1)!.time >
+        MARKET_INTERVAL_CONFIG[interval].staleAfterSeconds,
   );
 
   return (
@@ -1027,27 +1163,39 @@ export function MarketDashboard() {
               <h1 className="text-lg font-semibold tracking-tight text-white">
                 右側雷達
               </h1>
-              <p className="text-xs text-slate-500">五股日內價量確認</p>
+              <p className="text-xs text-slate-500">五股價量確認</p>
             </div>
           </div>
 
           <div className="flex flex-wrap items-center justify-end gap-2">
             <Select
               value={interval}
-              onValueChange={(value) => setIntervalValue(value as Interval)}
+              onValueChange={(value) => {
+                if (isMarketInterval(value)) setIntervalValue(value);
+              }}
             >
               <SelectTrigger className="h-9 border-white/10 bg-white/5 text-slate-200">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent className="border-white/10 bg-[#101b2b] text-slate-100">
-                <SelectItem value="1m">1 分鐘</SelectItem>
-                <SelectItem value="5m">5 分鐘</SelectItem>
+                {MARKET_INTERVALS.map((value) => (
+                  <SelectItem key={value} value={value}>
+                    {MARKET_INTERVAL_CONFIG[value].label}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
-            <label className="flex h-9 items-center gap-2 rounded-md border border-white/10 bg-white/5 px-3 text-sm text-slate-300">
+            <label
+              className={cn(
+                "flex h-9 items-center gap-2 rounded-md border border-white/10 bg-white/5 px-3 text-sm text-slate-300",
+                interval === "1d" && "cursor-not-allowed opacity-50",
+              )}
+              title={interval === "1d" ? "日線不適用盤前盤後" : undefined}
+            >
               <Switch
-                checked={prepost}
+                checked={interval === "1d" ? false : prepost}
                 onCheckedChange={setPrepost}
+                disabled={interval === "1d"}
                 aria-label="顯示盤前盤後"
               />
               盤前後
@@ -1189,7 +1337,7 @@ export function MarketDashboard() {
                     </span>
                     <span className="flex items-center gap-1.5">
                       <Clock3 className="h-3.5 w-3.5" />{" "}
-                      {interval === "1m" ? "1 分鐘" : "5 分鐘"} K
+                      {MARKET_INTERVAL_CONFIG[interval].label} K
                     </span>
                     <span className="flex items-center gap-1.5">
                       <Signal className="h-3.5 w-3.5" /> {countdown}s 後更新
@@ -1212,14 +1360,18 @@ export function MarketDashboard() {
                     </span>
                     <span className="flex items-center gap-1.5">
                       <i className="h-0.5 w-4 border-t border-dashed border-amber-300" />{" "}
-                      VWAP
+                      {interval === "1d" ? "20 日量價均線" : "VWAP"}
                     </span>
                     <span className="flex items-center gap-1.5">
                       <i className="h-0.5 w-4 border-t border-dashed border-cyan-300" />{" "}
                       突破位
                     </span>
                   </div>
-                  <PriceChart instrument={active} analysis={activeAnalysis} />
+                  <PriceChart
+                    instrument={active}
+                    analysis={activeAnalysis}
+                    interval={interval}
+                  />
                 </>
               ) : loading ? (
                 <Skeleton className="h-[430px] w-full bg-white/8" />
